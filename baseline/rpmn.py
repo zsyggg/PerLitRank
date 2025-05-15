@@ -1,0 +1,270 @@
+# rpmn.py
+"""
+RPMN (Re-finding Personalized Memory Network) (修正参数和导入)
+基于记忆网络的个性化搜索模型
+"""
+import json
+import logging
+import os
+import sys
+import torch
+import numpy as np
+from tqdm import tqdm
+from collections import defaultdict
+from transformers import AutoTokenizer, AutoModel
+import argparse # Import argparse
+
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('RPMN')
+
+# --- PyTorch and FAISS Check ---
+try:
+    import torch
+    import faiss
+except ImportError as e:
+    logger.error(f"Missing required library: {e}. Please install torch and faiss-cpu or faiss-gpu.")
+    sys.exit(1)
+
+class RPMNBaseline:
+    """RPMN基线方法实现"""
+
+    def __init__(self, model_path=None, device=None, batch_size=16):
+        self.logger = logger
+        self.model_path = model_path
+        if not self.model_path:
+             raise ValueError("Encoder model_path is required for RPMN.")
+        self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.batch_size = batch_size
+        self.logger.info(f"RPMN Initializing with device: {self.device}, batch_size: {self.batch_size}")
+
+        self.short_term_memory = {}
+        self.medium_term_memory = {}
+        self.long_term_memory = {}
+
+        self.tokenizer = None
+        self.model = None
+        self._setup_model()
+
+    def _setup_model(self):
+        """Loads the encoder model."""
+        try:
+            self.logger.info(f"加载编码器模型: {self.model_path}")
+            use_trust_remote_code = "gte" in self.model_path.lower() or "modelscope" in self.model_path
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path,
+                trust_remote_code=use_trust_remote_code
+            )
+            self.model = AutoModel.from_pretrained(
+                self.model_path,
+                trust_remote_code=use_trust_remote_code
+            ).to(self.device)
+            self.model.eval()
+            self.logger.info(f"编码器模型加载成功到设备: {self.device}")
+        except Exception as e:
+            self.logger.error(f"加载编码器模型失败: {e}", exc_info=True)
+            raise
+
+    def _encode_text(self, texts):
+        """编码文本列表为向量"""
+        if not texts: return np.array([])
+        embeddings = []
+        self.model.eval()
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i:i+self.batch_size]
+            try:
+                with torch.no_grad():
+                    inputs = self.tokenizer(batch, padding=True, truncation=True, return_tensors="pt", max_length=512).to(self.device)
+                    outputs = self.model(**inputs)
+                    if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
+                         batch_embeddings = outputs.pooler_output.cpu().numpy()
+                    elif hasattr(outputs, 'last_hidden_state'):
+                         batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+                    else:
+                         raise ValueError("Model output does not contain pooler_output or last_hidden_state")
+                    norms = np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+                    norms[norms == 0] = 1e-12
+                    batch_embeddings = batch_embeddings / norms
+                    embeddings.append(batch_embeddings)
+            except Exception as e:
+                self.logger.error(f"Error encoding batch (start index {i}): {e}", exc_info=True)
+                batch_embeddings = np.zeros((len(batch), self.model.config.hidden_size))
+                embeddings.append(batch_embeddings)
+        return np.vstack(embeddings) if embeddings else np.array([])
+
+    def _update_memories(self, query, history_queries=None, user_id=None):
+        """更新记忆网络"""
+        if user_id is None: user_id = "default_user"
+        try:
+            query_embedding = self._encode_text([query])
+            if query_embedding.size == 0: return
+            query_embedding = query_embedding[0]
+
+            if user_id not in self.short_term_memory: self.short_term_memory[user_id] = []
+            self.short_term_memory[user_id].append({"embedding": query_embedding})
+            self.short_term_memory[user_id] = self.short_term_memory[user_id][-5:]
+
+            if user_id not in self.medium_term_memory: self.medium_term_memory[user_id] = []
+            if history_queries:
+                 history_embeddings = self._encode_text(history_queries)
+                 if history_embeddings.size > 0:
+                     for emb in history_embeddings:
+                         self.medium_term_memory[user_id].append({"embedding": emb})
+            self.medium_term_memory[user_id].append({"embedding": query_embedding})
+            self.medium_term_memory[user_id] = self.medium_term_memory[user_id][-10:]
+
+            if user_id not in self.long_term_memory:
+                self.long_term_memory[user_id] = {"count": 0, "avg_embedding": np.zeros_like(query_embedding)}
+            memory = self.long_term_memory[user_id]
+            memory["count"] += 1
+            memory["avg_embedding"] = memory["avg_embedding"] + (query_embedding - memory["avg_embedding"]) / memory["count"]
+        except Exception as e:
+            self.logger.error(f"Error updating memories for user {user_id}: {e}", exc_info=True)
+
+    def _get_personalized_vector(self, query, history_queries=None, user_id=None):
+        """获取个性化查询向量"""
+        if user_id is None: user_id = "default_user"
+        try:
+            self._update_memories(query, history_queries, user_id)
+            query_embedding = self._encode_text([query])
+            if query_embedding.size == 0:
+                 self.logger.warning(f"Failed to encode query for {user_id}, returning zero vector.")
+                 return np.zeros(self.model.config.hidden_size)
+            query_embedding = query_embedding[0]
+
+            short_term_vec = np.zeros_like(query_embedding)
+            if user_id in self.short_term_memory and self.short_term_memory[user_id]:
+                short_term_vec = self.short_term_memory[user_id][-1]["embedding"]
+
+            medium_term_vec = np.zeros_like(query_embedding)
+            if user_id in self.medium_term_memory and self.medium_term_memory[user_id]:
+                 session_embeddings = [m["embedding"] for m in self.medium_term_memory[user_id]]
+                 if session_embeddings: medium_term_vec = np.mean(session_embeddings, axis=0)
+
+            long_term_vec = np.zeros_like(query_embedding)
+            if user_id in self.long_term_memory:
+                 long_term_vec = self.long_term_memory[user_id]["avg_embedding"]
+
+            personalized_vector = (0.6 * query_embedding + 0.2 * short_term_vec +
+                                   0.15 * medium_term_vec + 0.05 * long_term_vec)
+            norm = np.linalg.norm(personalized_vector)
+            if norm > 1e-12: personalized_vector = personalized_vector / norm
+            else: return query_embedding
+            return personalized_vector
+        except Exception as e:
+            self.logger.error(f"Error creating personalized vector for user {user_id}: {e}", exc_info=True)
+            query_embedding = self._encode_text([query])
+            return query_embedding[0] if query_embedding.size > 0 else np.zeros(self.model.config.hidden_size)
+
+    def load_corpus_and_embeddings(self, corpus_path, corpus_embeddings_path):
+        """加载语料库 (JSONL) 和嵌入向量"""
+        self.logger.info(f"Loading corpus (JSONL) from {corpus_path}")
+        corpus = {}; doc_ids = []
+        try:
+            with open(corpus_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line); doc_id = str(data.get('text_id', ''))
+                        if doc_id: corpus[doc_id] = data; doc_ids.append(doc_id)
+                    except json.JSONDecodeError: self.logger.warning(f"Skipping invalid JSON line in corpus: {line[:100]}...")
+        except Exception as e: self.logger.error(f"Error loading corpus: {e}", exc_info=True); raise
+
+        self.logger.info(f"Loading corpus embeddings from {corpus_embeddings_path}")
+        try:
+            corpus_embeddings = np.load(corpus_embeddings_path)
+            if corpus_embeddings.ndim != 2 or corpus_embeddings.shape[0] != len(doc_ids):
+                 raise ValueError(f"Embeddings shape mismatch: Expected ({len(doc_ids)}, dim), Got {corpus_embeddings.shape}")
+            if corpus_embeddings.dtype != np.float32:
+                 self.logger.warning(f"Converting embeddings to float32 for FAISS.")
+                 corpus_embeddings = corpus_embeddings.astype(np.float32)
+        except Exception as e: self.logger.error(f"Error loading/validating embeddings: {e}", exc_info=True); raise
+        self.logger.info(f"Loaded {len(corpus)} documents and embeddings shape {corpus_embeddings.shape}")
+        return corpus, doc_ids, corpus_embeddings
+
+    def search(self, query, history_queries=None, user_id=None, corpus_embeddings=None, doc_ids=None, index=None, top_k=10):
+        """使用 FAISS 索引搜索相关文档"""
+        if index is None: self.logger.error("FAISS index not provided"); return []
+        try:
+            query_vector = self._get_personalized_vector(query, history_queries, user_id)
+            query_vector_np = query_vector.reshape(1, -1).astype(np.float32)
+            scores, indices = index.search(query_vector_np, top_k)
+            results = []
+            if scores.size > 0 and indices.size > 0:
+                 for score, idx in zip(scores[0], indices[0]):
+                     if idx != -1 and idx < len(doc_ids): results.append({"text_id": doc_ids[idx], "score": float(score)})
+            return results
+        except Exception as e: self.logger.error(f"Error during FAISS search for user {user_id}: {e}", exc_info=True); return []
+
+    def process_dataset(self, input_file, output_file, corpus_path, corpus_embeddings_path):
+        """处理数据集 (JSONL 格式)"""
+        # File existence checks
+        if not all(os.path.exists(p) for p in [input_file, corpus_path, corpus_embeddings_path]):
+            self.logger.error("One or more input files not found. Exiting.")
+            return
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        self.logger.info(f"Processing queries from {input_file}")
+
+        try:
+            corpus, doc_ids, corpus_embeddings = self.load_corpus_and_embeddings(corpus_path, corpus_embeddings_path)
+            dimension = corpus_embeddings.shape[1]
+            index = faiss.IndexFlatIP(dimension); index.add(corpus_embeddings)
+            self.logger.info(f"FAISS index created with {index.ntotal} vectors.")
+
+            queries_data = []
+            with open(input_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try: queries_data.append(json.loads(line.strip()))
+                    except json.JSONDecodeError: self.logger.warning(f"Skipping invalid JSON line in input: {line[:100]}...")
+
+            final_results = []; processed_count = 0
+            for item in tqdm(queries_data, desc="Processing queries"):
+                query_id = str(item.get("query_id", "")); current_query = item.get("query", "")
+                if not query_id or not current_query: continue
+                history_queries = [] # Simplified: Assume no history for baseline run
+                search_results = self.search(current_query, history_queries, query_id, corpus_embeddings, doc_ids, index, 10)
+                full_results = []
+                for res in search_results:
+                    doc_id_res = res["text_id"]
+                    if doc_id_res in corpus:
+                        doc_data = corpus[doc_id_res]
+                        full_results.append({"text_id": doc_id_res, "title": doc_data.get("title", ""), "text": doc_data.get("text", ""), "score": res["score"]})
+                    else: self.logger.warning(f"Doc ID {doc_id_res} not found in corpus.")
+                final_results.append({"query_id": query_id, "query": current_query, "results": full_results})
+                processed_count += 1
+
+            with open(output_file, 'w', encoding='utf-8') as f_out:
+                for result in final_results: f_out.write(json.dumps(result, ensure_ascii=False) + '\n')
+            self.logger.info(f"Processed {processed_count} queries. Results saved to {output_file}")
+
+        except Exception as e: self.logger.error(f"Error processing dataset: {e}", exc_info=True); raise
+
+def main():
+    parser = argparse.ArgumentParser(description='RPMN Baseline (No Continuity/Parquet)')
+    parser.add_argument('--input_file', type=str, required=True, help='Input queries file path (JSONL format)')
+    parser.add_argument('--output_file', type=str, required=True, help='Output results file path (JSONL)')
+    parser.add_argument('--corpus_path', type=str, required=True, help='Corpus file path (JSONL format)')
+    parser.add_argument('--corpus_embeddings_path', type=str, required=True, help='Corpus embeddings file path (.npy)')
+    parser.add_argument('--model_path', type=str, required=True, help='Path to the encoder model (e.g., GTE)')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for encoding')
+    parser.add_argument('--device', type=str, default=None, help='Device (e.g., cuda:0, cpu)') # Added device arg
+    # Removed continuity and corpus_format args
+
+    args = parser.parse_args()
+
+    # Determine device if not specified
+    if args.device is None:
+         args.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+         logger.info(f"Device not specified, using: {args.device}")
+    elif not (args.device == "cpu" or (args.device.startswith("cuda:") and args.device.split(':')[1].isdigit())):
+         logger.error(f"Invalid device format: '{args.device}'. Use 'cpu' or 'cuda:N'. Exiting.")
+         sys.exit(1)
+
+    try:
+        rpmn = RPMNBaseline(model_path=args.model_path, device=args.device, batch_size=args.batch_size)
+        rpmn.process_dataset(args.input_file, args.output_file, args.corpus_path, args.corpus_embeddings_path)
+    except Exception as e:
+         logger.error(f"RPMN execution failed: {e}", exc_info=True)
+         sys.exit(1)
+
+if __name__ == '__main__':
+    main()
